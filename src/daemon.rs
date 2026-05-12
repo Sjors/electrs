@@ -200,6 +200,18 @@ impl Daemon {
     }
 
     pub(crate) fn estimate_fee(&self, nblocks: u16) -> Result<Option<Amount>> {
+        if let Some(ipc) = &self.ipc {
+            // Chain.estimateSmartFee returns CFeeRate{} (size==0) when no
+            // estimate is available, which mirrors the JSON-RPC -32603
+            // ("Insufficient data or no feerate found") behaviour we map to
+            // None below.
+            let sat_per_kvb = ipc
+                .estimate_smart_fee_sat_per_kvb(nblocks.into())
+                .context("failed to estimate fee via IPC")?;
+            return Ok(sat_per_kvb
+                .filter(|n| *n > 0)
+                .map(|n| Amount::from_sat(n as u64)));
+        }
         let res = self.rpc.estimate_smart_fee(nblocks, None);
         if let Err(bitcoincore_rpc::Error::JsonRpc(jsonrpc::Error::Rpc(RpcError {
             code: -32603,
@@ -212,6 +224,16 @@ impl Daemon {
     }
 
     pub(crate) fn get_relay_fee(&self) -> Result<Amount> {
+        if let Some(ipc) = &self.ipc {
+            let sat_per_kvb = ipc
+                .relay_min_fee_sat_per_kvb()
+                .context("failed to fetch relay min fee via IPC")?;
+            // sat_per_kvb is non-negative in practice (the node clamps the
+            // configured -minrelaytxfee at 0); guard against a corrupt or
+            // hostile reply by saturating at 0 rather than panicking on the
+            // i64 -> u64 conversion.
+            return Ok(Amount::from_sat(sat_per_kvb.max(0) as u64));
+        }
         Ok(self
             .rpc
             .get_network_info()

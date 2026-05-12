@@ -292,6 +292,54 @@ impl IpcChain {
         })
     }
 
+    /// Get the node's minimum relay feerate via `Chain.relayMinFee`. The
+    /// reply is a serialized `CFeeRate` blob (see [`decode_fee_rate_kvb`]);
+    /// this method returns the rate as satoshis per kilo-vbyte.
+    ///
+    /// Replaces the JSON-RPC `getnetworkinfo.relayfee` lookup used by
+    /// [`Daemon::get_relay_fee`] when IPC is configured.
+    pub(crate) fn relay_min_fee_sat_per_kvb(&self) -> Result<i64> {
+        self.call(|ctx| {
+            async move {
+                let mut req = ctx.chain.relay_min_fee_request();
+                req.get().get_context()?.set_thread(ctx.thread.clone());
+                let resp = req.send().promise.await?;
+                let blob = resp.get()?.get_result()?;
+                Ok(decode_fee_rate_kvb(blob)?.unwrap_or(0))
+            }
+            .boxed_local()
+        })
+    }
+
+    /// Smart fee estimate for confirmation within `nblocks`, via
+    /// `Chain.estimateSmartFee`. Returns `Ok(None)` if the node has no
+    /// estimate available (a `CFeeRate{}` with `size == 0`), otherwise the
+    /// rate as satoshis per kilo-vbyte.
+    ///
+    /// Replaces the JSON-RPC `estimatesmartfee` call used by
+    /// [`Daemon::estimate_fee`] when IPC is configured.
+    pub(crate) fn estimate_smart_fee_sat_per_kvb(&self, nblocks: i32) -> Result<Option<i64>> {
+        self.call(move |ctx| {
+            async move {
+                let mut req = ctx.chain.estimate_smart_fee_request();
+                req.get().get_context()?.set_thread(ctx.thread.clone());
+                {
+                    let mut params = req.get();
+                    params.set_num_blocks(nblocks);
+                    // Match the JSON-RPC default for `estimatesmartfee`:
+                    // economical (non-conservative) mode.
+                    params.set_conservative(false);
+                    // We don't surface FeeCalculation diagnostics to clients.
+                    params.set_want_calc(false);
+                }
+                let resp = req.send().promise.await?;
+                let blob = resp.get()?.get_result()?;
+                decode_fee_rate_kvb(blob)
+            }
+            .boxed_local()
+        })
+    }
+
     /// Find the height of the highest block in `locator` that is part of the
     /// node's active chain, via `Chain.findLocatorFork`. Returns `None` if no
     /// hash in the locator is on the active chain (e.g. completely diverged
@@ -477,6 +525,27 @@ async fn snapshot_tip_hash(ctx: &Ctx) -> Result<[u8; 32]> {
     let mut buf = [0u8; 32];
     buf.copy_from_slice(bytes);
     Ok(buf)
+}
+
+/// Decode a serialized Bitcoin Core `CFeeRate` blob into satoshis per
+/// kilo-vbyte (matching `CFeeRate::GetFeePerK()`). Wire format is
+/// `FeeFrac { int64_t fee; int32_t size; }` (12 bytes LE), per
+/// `SERIALIZE_METHODS(CFeeRate, ...)`. Returns `Ok(None)` for the empty
+/// `CFeeRate{}` case (`size == 0`), which Bitcoin Core uses to mean "no
+/// estimate available".
+fn decode_fee_rate_kvb(blob: &[u8]) -> Result<Option<i64>> {
+    if blob.len() != 12 {
+        bail!(
+            "expected serialized CFeeRate to be 12 bytes (int64 fee + int32 size), got {}",
+            blob.len()
+        );
+    }
+    let fee = i64::from_le_bytes(blob[0..8].try_into().expect("len 8"));
+    let size = i32::from_le_bytes(blob[8..12].try_into().expect("len 4"));
+    if size == 0 {
+        return Ok(None);
+    }
+    Ok(Some(fee.saturating_mul(1000) / size as i64))
 }
 
 /// Bitcoin Core CompactSize encoding (src/serialize.h).
