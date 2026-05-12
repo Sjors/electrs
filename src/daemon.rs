@@ -187,6 +187,12 @@ impl Daemon {
     }
 
     pub(crate) fn broadcast(&self, tx: &Transaction) -> Result<Txid> {
+        if let Some(ipc) = &self.ipc {
+            let bytes = bitcoin::consensus::serialize(tx);
+            ipc.broadcast_transaction(bytes)
+                .context("failed to broadcast transaction via IPC")?;
+            return Ok(tx.compute_txid());
+        }
         self.rpc
             .send_raw_transaction(tx)
             .context("failed to broadcast transaction")

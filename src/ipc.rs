@@ -174,6 +174,42 @@ impl IpcChain {
             .boxed_local()
         })
     }
+
+    /// Broadcast a serialized transaction via `Chain.broadcastTransaction`,
+    /// using the same `MEMPOOL_AND_BROADCAST_TO_ALL` semantics as the
+    /// JSON-RPC `sendrawtransaction` call. `max_tx_fee` matches the RPC
+    /// default (`DEFAULT_MAX_RAW_TX_FEE = 0.10 BTC`). On failure the node's
+    /// error string is propagated.
+    pub(crate) fn broadcast_transaction(&self, tx_bytes: Vec<u8>) -> Result<()> {
+        // node::TxBroadcast::MEMPOOL_AND_BROADCAST_TO_ALL = 0
+        const BROADCAST_METHOD_DEFAULT: i32 = 0;
+        // src/policy/policy.h: DEFAULT_MAX_RAW_TX_FEE = 0.10 * COIN
+        const MAX_TX_FEE_DEFAULT: i64 = 10_000_000;
+        self.call(move |ctx| {
+            async move {
+                let mut req = ctx.chain.broadcast_transaction_request();
+                req.get().get_context()?.set_thread(ctx.thread.clone());
+                {
+                    let mut params = req.get();
+                    params.set_tx(&tx_bytes);
+                    params.set_max_tx_fee(MAX_TX_FEE_DEFAULT);
+                    params.set_broadcast_method(BROADCAST_METHOD_DEFAULT);
+                }
+                let resp = req.send().promise.await?;
+                let r = resp.get()?;
+                if r.get_result() {
+                    Ok(())
+                } else {
+                    let err = r.get_error()?.to_str()?;
+                    if err.is_empty() {
+                        bail!("Chain.broadcastTransaction failed");
+                    }
+                    bail!("Chain.broadcastTransaction failed: {err}");
+                }
+            }
+            .boxed_local()
+        })
+    }
 }
 
 /// Worker thread entry point. Owns the tokio runtime, the capnp RPC system,
