@@ -238,6 +238,15 @@ impl Daemon {
     }
 
     pub(crate) fn get_block_txids(&self, blockhash: BlockHash) -> Result<Vec<Txid>> {
+        if let Some(ipc) = &self.ipc {
+            let bytes = ipc
+                .get_block(blockhash)
+                .with_context(|| format!("IPC findBlock failed for {blockhash}"))?
+                .ok_or_else(|| anyhow!("IPC findBlock: block {blockhash} not found"))?;
+            let block = crate::ipc::decode_block(&bytes)
+                .with_context(|| format!("failed to decode block {blockhash}"))?;
+            return Ok(block.txdata.iter().map(|tx| tx.compute_txid()).collect());
+        }
         Ok(self
             .rpc
             .get_block_info(&blockhash)
