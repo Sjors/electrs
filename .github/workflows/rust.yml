@@ -30,12 +30,9 @@ jobs:
         run: |
           git clone --depth 1 --branch 2026/04/chain-interface \
             https://github.com/Sjors/bitcoin-capnp-types.git ../capnp-types
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: rustfmt, clippy
-
-      - name: Install Rust
-        run: rustup component add rustfmt clippy
 
       - name: Install other dependencies
         run: sudo apt install build-essential libclang-dev capnproto libcapnp-dev
@@ -75,7 +72,7 @@ jobs:
           git clone --depth 1 --branch 2026/04/chain-interface \
             https://github.com/Sjors/bitcoin-capnp-types.git ../capnp-types
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
 
       - name: Install build & test dependencies
         run: |
