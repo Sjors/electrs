@@ -84,7 +84,7 @@ jobs:
             build-essential cmake pkgconf python3 \
             libevent-dev libboost-dev capnproto libcapnp-dev \
             librocksdb-dev libclang-dev ccache \
-            python3-venv python3-pip git jq curl libsecp256k1-2
+            python3-venv python3-pip git jq curl libsecp256k1-dev
 
       - name: ccache
         uses: actions/cache@v4
@@ -110,9 +110,9 @@ jobs:
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           cmake --build build -j $(nproc) --target bitcoin bitcoin-node bitcoin-cli
 
-      - name: Install Electrum wallet
+      - name: Install Electrum wallet (4.7.2)
         run: |
-          git clone --depth 1 --recurse-submodules https://github.com/spesmilo/electrum/
+          git clone --depth 1 --branch 4.7.2 --recurse-submodules https://github.com/spesmilo/electrum/
           python3 -m venv --system-site-packages venv
           ELECTRUM_ECC_DONT_COMPILE=1 venv/bin/pip install -e electrum/
           sudo ln -s "$PWD/venv/bin/electrum" /usr/local/bin/electrum

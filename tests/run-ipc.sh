@@ -16,6 +16,7 @@ fi
 
 rm -rf data/
 mkdir -p data/{bitcoin,electrum,electrs}
+touch data/electrs/regtest-debug.log data/electrum/regtest-debug.log
 
 cleanup() {
   trap - SIGTERM SIGINT
@@ -34,18 +35,50 @@ wait_for() {
   shift
   TEST_ARGS=$*
   for _ in `seq 0 9`; do
-    test "$($CMD | jq -c .)" $TEST_ARGS && break || sleep 2
+    if test "$($CMD | jq -c .)" $TEST_ARGS; then
+      return 0
+    fi
+    sleep 2
   done
+
+  echo "Timed out waiting for condition: $CMD $TEST_ARGS" >&2
+  return 1
+}
+
+wait_for_log() {
+  LOG_FILE=$1
+  PATTERN=$2
+  DESCRIPTION=$3
+  for _ in `seq 0 99`; do
+    if grep -Fq "$PATTERN" "$LOG_FILE"; then
+      return 0
+    fi
+    sleep 0.2
+  done
+
+  echo "Timed out waiting for $DESCRIPTION in $LOG_FILE" >&2
+  tail -n +1 "$LOG_FILE" >&2 || true
+  return 1
+}
+
+wait_for_http() {
+  URL=$1
+  OUTPUT=$2
+  for _ in `seq 0 99`; do
+    if curl --silent --show-error --fail "$URL" -o "$OUTPUT"; then
+      return 0
+    fi
+    sleep 0.2
+  done
+
+  echo "Timed out waiting for HTTP endpoint $URL" >&2
+  return 1
 }
 
 BTC="$BITCOIN_MULTIPROCESS_BIN rpc -chain=regtest -datadir=$PWD/data/bitcoin"
 ELECTRUM="electrum --regtest"
 EL="$ELECTRUM --wallet=data/electrum/wallet"
 SOCK="$PWD/data/bitcoin/regtest/node.sock"
-
-tail_log() {
-	tail -n +0 -F $1 || true
-}
 
 echo "Starting $($BITCOIN_MULTIPROCESS_BIN node -version | head -n1) (multiprocess, IPC enabled)..."
 $BITCOIN_MULTIPROCESS_BIN node \
@@ -80,7 +113,7 @@ electrs \
   --daemon-ipc-socket="$SOCK" \
   2> data/electrs/regtest-debug.log &
 ELECTRS_PID=$!
-tail_log data/electrs/regtest-debug.log | grep -m1 "serving Electrum RPC"
+wait_for_log data/electrs/regtest-debug.log "serving Electrum RPC" "electrs Electrum RPC startup"
 
 # Confirm the IPC backend actually engaged. The Daemon::connect path logs
 # nothing distinctive yet; instead probe the debug log for any IPC error or
@@ -89,11 +122,11 @@ if ! grep -q "ipc" data/electrs/regtest-debug.log; then
   : # no explicit log line yet; we rely on cargo tests + functional behaviour
 fi
 
-curl localhost:24224 -o metrics.txt
+wait_for_http http://localhost:24224 metrics.txt
 
 $ELECTRUM daemon --server localhost:60401:t -1 -vDEBUG 2> data/electrum/regtest-debug.log &
 ELECTRUM_PID=$!
-tail_log data/electrum/regtest-debug.log | grep -m1 "connection established"
+wait_for_log data/electrum/regtest-debug.log "connection established" "Electrum daemon connection"
 $EL getinfo | jq .
 
 echo "Loading Electrum wallet..."
@@ -125,7 +158,7 @@ $BTC getblockcount > /dev/null
 
 echo " * wait for new block"
 kill -USR1 $ELECTRS_PID  # notify server to index new block
-tail_log data/electrum/regtest-debug.log | grep -m1 "verified $TXID" > /dev/null
+wait_for_log data/electrum/regtest-debug.log "verified $TXID" "Electrum wallet verification of mined transaction"
 
 echo " * get_tx_status"
 test "`$EL get_tx_status $TXID | jq -c .`" == '{"confirmations":1}'
@@ -140,7 +173,7 @@ echo "Electrum `$EL stop`"  # disconnect wallet
 wait $ELECTRUM_PID
 
 kill -INT $ELECTRS_PID  # close server
-tail_log data/electrs/regtest-debug.log | grep -m1 "electrs stopped"
+wait_for_log data/electrs/regtest-debug.log "electrs stopped" "electrs shutdown"
 wait $ELECTRS_PID
 
 # When the multiprocess node has IPC clients still attached at shutdown, the
