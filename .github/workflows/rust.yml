@@ -119,9 +119,6 @@ jobs:
           electrum version --offline
 
       - name: Build electrs
-        env:
-          ROCKSDB_INCLUDE_DIR: /usr/include
-          ROCKSDB_LIB_DIR: /usr/lib
         run: cargo build --locked --bin electrs
 
       - name: Run IPC integration test
