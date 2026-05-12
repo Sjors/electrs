@@ -21,7 +21,9 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use bitcoin::blockdata::block::Header as BlockHeader;
-use bitcoin::{consensus::deserialize, consensus::Decodable, hashes::Hash, BlockHash};
+use bitcoin::{
+    consensus::deserialize, consensus::Decodable, hashes::Hash, Amount, BlockHash, OutPoint,
+};
 use bitcoin_capnp_types::{
     chain_capnp::{chain, chain_notifications},
     init_capnp::init,
@@ -71,6 +73,11 @@ pub(crate) struct IpcChain {
     /// (best-effort) so the cache never grows without bound during initial
     /// sync.
     header_fetch_cache: Arc<Mutex<BlockCache>>,
+}
+
+pub(crate) struct IpcCoin {
+    pub(crate) value: Amount,
+    pub(crate) height: u32,
 }
 
 /// In-memory cache of recently fetched blocks, drained by
@@ -359,6 +366,44 @@ impl IpcChain {
                 let resp = req.send().promise.await?;
                 let blob = resp.get()?.get_result()?;
                 decode_fee_rate_kvb(blob)
+            }
+            .boxed_local()
+        })
+    }
+
+    /// Look up prevout coins through `Chain.findCoins`. The interface takes a
+    /// `std::map<COutPoint, Coin>&`, encoded as key/value byte pairs. The
+    /// incoming `Coin` values are placeholders; the node overwrites them with
+    /// coins from the active UTXO set or mempool.
+    pub(crate) fn find_coins(&self, outpoints: Vec<OutPoint>) -> Result<Vec<IpcCoin>> {
+        self.call(move |ctx| {
+            async move {
+                let mut req = ctx.chain.find_coins_request();
+                req.get().get_context()?.set_thread(ctx.thread.clone());
+                {
+                    let mut coins = req.get().init_coins(outpoints.len() as u32);
+                    for (i, outpoint) in outpoints.iter().enumerate() {
+                        let mut pair = coins.reborrow().get(i as u32);
+                        pair.set_key(&serialize_outpoint(outpoint)[..])?;
+                        pair.set_value(DUMMY_COIN)?;
+                    }
+                }
+                let resp = req.send().promise.await?;
+                let coins = resp.get()?.get_coins()?;
+                if coins.len() != outpoints.len() as u32 {
+                    bail!(
+                        "Chain.findCoins returned {} coins, expected {}",
+                        coins.len(),
+                        outpoints.len()
+                    );
+                }
+
+                let mut result = Vec::with_capacity(outpoints.len());
+                for i in 0..coins.len() {
+                    let pair = coins.get(i);
+                    result.push(decode_coin(pair.get_value()?)?);
+                }
+                Ok(result)
             }
             .boxed_local()
         })
@@ -701,6 +746,87 @@ fn decode_fee_rate_kvb(blob: &[u8]) -> Result<Option<i64>> {
     Ok(Some(fee.saturating_mul(1000) / size as i64))
 }
 
+/// Serialized `Coin{CTxOut{0, empty script}, height=0, coinbase=false}`.
+/// `findCoins` treats request coin values as placeholders, but the map
+/// decoder still needs each value to deserialize as a valid `Coin`.
+const DUMMY_COIN: &[u8] = &[0x00, 0x00, 0x06];
+
+fn serialize_outpoint(outpoint: &OutPoint) -> [u8; 36] {
+    let mut buf = [0u8; 36];
+    buf[..32].copy_from_slice(outpoint.txid.as_byte_array());
+    buf[32..].copy_from_slice(&outpoint.vout.to_le_bytes());
+    buf
+}
+
+fn decode_coin(blob: &[u8]) -> Result<IpcCoin> {
+    let mut pos = 0;
+    let code = read_core_varint(blob, &mut pos)?;
+    let compressed_amount = read_core_varint(blob, &mut pos)?;
+    let script_size = read_core_varint(blob, &mut pos)?;
+    let script_bytes = match script_size {
+        0 | 1 => 20,
+        2..=5 => 32,
+        n => n
+            .checked_sub(6)
+            .ok_or_else(|| anyhow!("invalid compressed script size code {n}"))?,
+    } as usize;
+    if blob.len().saturating_sub(pos) != script_bytes {
+        bail!(
+            "serialized Coin script has {} bytes, expected {}",
+            blob.len().saturating_sub(pos),
+            script_bytes
+        );
+    }
+    Ok(IpcCoin {
+        value: Amount::from_sat(decompress_amount(compressed_amount)),
+        height: (code >> 1)
+            .try_into()
+            .context("serialized Coin height overflow")?,
+    })
+}
+
+/// Bitcoin Core VARINT encoding (base-128 with subtract-one continuation).
+fn read_core_varint(blob: &[u8], pos: &mut usize) -> Result<u64> {
+    let mut n = 0u64;
+    loop {
+        let Some(&ch) = blob.get(*pos) else {
+            bail!("unexpected end of Bitcoin Core VARINT");
+        };
+        *pos += 1;
+        n = n
+            .checked_shl(7)
+            .and_then(|n| n.checked_add((ch & 0x7f) as u64))
+            .ok_or_else(|| anyhow!("Bitcoin Core VARINT overflow"))?;
+        if ch & 0x80 == 0 {
+            return Ok(n);
+        }
+        n = n
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("Bitcoin Core VARINT overflow"))?;
+    }
+}
+
+/// Inverse of Bitcoin Core's `CompressAmount`.
+fn decompress_amount(mut x: u64) -> u64 {
+    if x == 0 {
+        return 0;
+    }
+    x -= 1;
+    let e = x % 10;
+    x /= 10;
+    let mut n = if e < 9 {
+        let d = (x % 9) + 1;
+        x /= 9;
+        x * 10 + d
+    } else {
+        x + 1
+    };
+    for _ in 0..e {
+        n *= 10;
+    }
+    n
+}
+
 /// Bitcoin Core CompactSize encoding (src/serialize.h).
 fn write_compact_size(buf: &mut Vec<u8>, n: u64) {
     if n < 253 {
@@ -810,4 +936,37 @@ pub(crate) fn decode_block(buf: &[u8]) -> Result<bitcoin::Block> {
     let mut cursor = std::io::Cursor::new(buf);
     bitcoin::Block::consensus_decode(&mut cursor)
         .map_err(|e| anyhow!("failed to decode block: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decompress_amount, read_core_varint};
+
+    #[test]
+    fn decodes_core_varint_examples() {
+        for (bytes, expected) in [
+            (&[0x00][..], 0),
+            (&[0x7f][..], 0x7f),
+            (&[0x80, 0x00][..], 0x80),
+            (&[0xa3, 0x34][..], 0x1234),
+            (&[0x82, 0xfe, 0x7f][..], 0xffff),
+        ] {
+            let mut pos = 0;
+            assert_eq!(read_core_varint(bytes, &mut pos).unwrap(), expected);
+            assert_eq!(pos, bytes.len());
+        }
+    }
+
+    #[test]
+    fn decompresses_bitcoin_amounts() {
+        for (compressed, sats) in [
+            (0, 0),
+            (1, 1),
+            (7, 1000000),
+            (9, 100000000),
+            (50, 5000000000),
+        ] {
+            assert_eq!(decompress_amount(compressed), sats);
+        }
+    }
 }

@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 
 use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::{consensus::deserialize, hashes::hex::FromHex};
-use bitcoin::{Amount, BlockHash, Transaction, Txid};
+use bitcoin::{Amount, BlockHash, OutPoint, Transaction, Txid};
 use bitcoincore_rpc::{json, jsonrpc, Auth, Client, RpcApi};
 use crossbeam_channel::Receiver;
 use parking_lot::Mutex;
@@ -16,7 +16,7 @@ use std::path::Path;
 use crate::{
     chain::{Chain, NewHeader},
     config::Config,
-    ipc::IpcChain,
+    ipc::{IpcChain, IpcCoin},
     mempool::MempoolEvent,
     metrics::Metrics,
     p2p::Connection,
@@ -381,6 +381,14 @@ impl Daemon {
                 }
             })
             .collect())
+    }
+
+    pub(crate) fn find_coins(&self, outpoints: Vec<OutPoint>) -> Result<Vec<IpcCoin>> {
+        self.ipc
+            .as_ref()
+            .context("Chain.findCoins requested without IPC connection")?
+            .find_coins(outpoints)
+            .context("Chain.findCoins failed")
     }
 
     pub(crate) fn get_new_headers(&self, chain: &Chain) -> Result<Vec<NewHeader>> {
