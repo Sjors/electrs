@@ -621,12 +621,27 @@ impl chain_notifications::Server for ChainNotificationHandler {
         Ok(())
     }
 
-    fn block_connected(
+    async fn block_connected(
         self: Rc<Self>,
-        _: chain_notifications::BlockConnectedParams,
+        params: chain_notifications::BlockConnectedParams,
         _: chain_notifications::BlockConnectedResults,
-    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
-        std::future::ready(Ok(()))
+    ) -> std::result::Result<(), capnp::Error> {
+        let p = params.get()?;
+        let data = p.get_block()?.get_data()?;
+        if data.is_empty() {
+            warn!("IPC notification: connected block without block data");
+            return Ok(());
+        }
+        match deserialize::<bitcoin::Block>(data) {
+            Ok(block) => {
+                for tx in block.txdata {
+                    self.send_mempool_event(MempoolEvent::Removed(tx.compute_txid()));
+                }
+            }
+            Err(e) => warn!("IPC notification: invalid connected block: {e}"),
+        }
+        self.send_block_event();
+        Ok(())
     }
 
     fn block_disconnected(
