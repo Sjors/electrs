@@ -16,6 +16,7 @@ use std::path::Path;
 use crate::{
     chain::{Chain, NewHeader},
     config::Config,
+    ipc::IpcChain,
     metrics::Metrics,
     p2p::Connection,
     signals::ExitFlag,
@@ -102,6 +103,7 @@ fn rpc_connect(config: &Config) -> Result<Client> {
 pub struct Daemon {
     p2p: Mutex<Connection>,
     rpc: Client,
+    ipc: Option<IpcChain>,
 }
 
 impl Daemon {
@@ -144,7 +146,17 @@ impl Daemon {
             metrics,
             config.magic,
         )?);
-        Ok(Self { p2p, rpc })
+        let ipc = match config.daemon_ipc_socket.as_deref() {
+            Some(path) => {
+                info!(
+                    "connecting to bitcoin-node IPC socket: {} (experimental)",
+                    path.display()
+                );
+                Some(IpcChain::connect(path).context("IPC chain connection failed")?)
+            }
+            None => None,
+        };
+        Ok(Self { p2p, rpc, ipc })
     }
 
     pub(crate) fn estimate_fee(&self, nblocks: u16) -> Result<Option<Amount>> {
@@ -292,12 +304,27 @@ impl Daemon {
         self.p2p.lock().get_new_headers(chain)
     }
 
-    pub(crate) fn for_blocks<B, F>(&self, blockhashes: B, func: F) -> Result<()>
+    pub(crate) fn for_blocks<B, F>(&self, blockhashes: B, mut func: F) -> Result<()>
     where
         B: IntoIterator<Item = BlockHash>,
         F: FnMut(BlockHash, SerBlock),
     {
-        self.p2p.lock().for_blocks(blockhashes, func)
+        if let Some(ipc) = &self.ipc {
+            // Fetch each block over IPC instead of P2P. The Chain interface's
+            // `findBlock(wantData=true)` returns the same serialized form
+            // electrs's P2P path delivers, so the downstream pipeline is
+            // unchanged.
+            for hash in blockhashes {
+                let block = ipc
+                    .get_block(hash)
+                    .with_context(|| format!("IPC findBlock failed for {hash}"))?
+                    .ok_or_else(|| anyhow!("IPC findBlock: block {hash} not found"))?;
+                func(hash, block);
+            }
+            Ok(())
+        } else {
+            self.p2p.lock().for_blocks(blockhashes, func)
+        }
     }
 
     pub(crate) fn new_block_notification(&self) -> Receiver<()> {
