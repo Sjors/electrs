@@ -136,10 +136,6 @@ impl Daemon {
         if !network_info.network_active {
             bail!("electrs requires active bitcoind p2p network");
         }
-        let info = rpc.get_blockchain_info()?;
-        if info.pruned {
-            bail!("electrs requires non-pruned bitcoind node");
-        }
 
         let p2p = Mutex::new(Connection::connect(
             config.daemon_p2p_addr,
@@ -156,6 +152,17 @@ impl Daemon {
             }
             None => None,
         };
+
+        // Check the node is non-pruned, preferring the IPC chain interface
+        // over the JSON-RPC `getblockchaininfo` call when it is available.
+        let pruned = match &ipc {
+            Some(ipc) => ipc.have_pruned().context("Chain.havePruned failed")?,
+            None => rpc.get_blockchain_info()?.pruned,
+        };
+        if pruned {
+            bail!("electrs requires non-pruned bitcoind node");
+        }
+
         Ok(Self { p2p, rpc, ipc })
     }
 
