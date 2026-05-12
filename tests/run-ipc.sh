@@ -84,6 +84,7 @@ echo "Starting $($BITCOIN_MULTIPROCESS_BIN node -version | head -n1) (multiproce
 $BITCOIN_MULTIPROCESS_BIN node \
   -regtest -datadir=$PWD/data/bitcoin \
   -ipcbind=unix \
+  -listen=0 \
   -printtoconsole=0 \
   -fallbackfee=0.0001 &
 BITCOIND_PID=$!
@@ -114,13 +115,7 @@ electrs \
   2> data/electrs/regtest-debug.log &
 ELECTRS_PID=$!
 wait_for_log data/electrs/regtest-debug.log "serving Electrum RPC" "electrs Electrum RPC startup"
-
-# Confirm the IPC backend actually engaged. The Daemon::connect path logs
-# nothing distinctive yet; instead probe the debug log for any IPC error or
-# verify the for_blocks code path was taken by checking a unique marker.
-if ! grep -q "ipc" data/electrs/regtest-debug.log; then
-  : # no explicit log line yet; we rely on cargo tests + functional behaviour
-fi
+wait_for_log data/electrs/regtest-debug.log "connecting to bitcoin-node IPC socket" "electrs IPC backend connection"
 
 wait_for_http http://localhost:24224 metrics.txt
 
