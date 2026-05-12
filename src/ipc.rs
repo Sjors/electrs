@@ -12,7 +12,9 @@
 //! type-erased async closures returning their results through a oneshot.
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread as stdthread;
 use std::time::Duration;
 
@@ -27,6 +29,7 @@ use bitcoin_capnp_types::{
 use capnp_rpc::{rpc_twoparty_capnp::Side, twoparty::VatNetwork, RpcSystem};
 use crossbeam_channel::{bounded, Receiver};
 use futures::{future::LocalBoxFuture, io::BufReader, FutureExt};
+use parking_lot::Mutex;
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -52,10 +55,63 @@ struct Ctx {
 }
 
 /// Sync handle to the IPC worker thread. Cloneable; clones share the same
-/// connection.
+/// connection and the same header-fetch block cache.
 #[derive(Clone)]
 pub(crate) struct IpcChain {
     tx: mpsc::UnboundedSender<Job>,
+    /// Blocks that were downloaded by [`IpcChain::get_new_headers`] (which
+    /// has to fetch the full block payload over IPC just to extract the 80
+    /// header bytes, since the Chain interface exposes no header-only
+    /// fetch). The very next thing electrs's indexing pipeline does is call
+    /// [`Daemon::for_blocks`] over the same hashes, so handing those
+    /// payloads back from the cache avoids a duplicate IPC round-trip per
+    /// block. Bounded by total bytes; on overflow, inserts are skipped
+    /// (best-effort) so the cache never grows without bound during initial
+    /// sync.
+    header_fetch_cache: Arc<Mutex<BlockCache>>,
+}
+
+/// In-memory cache of recently fetched blocks, drained by
+/// [`IpcChain::get_block`] on hit. Keyed by block hash, bounded by total
+/// payload bytes.
+#[derive(Default)]
+struct BlockCache {
+    map: HashMap<BlockHash, SerBlock>,
+    bytes: usize,
+}
+
+/// Soft upper bound on the bytes held in the header-fetch cache. Sized to
+/// comfortably hold one [`IpcChain::get_new_headers`] batch (capped at
+/// `MAX_HEADERS` blocks) under typical mainnet block sizes (~2 MiB), with
+/// headroom for a few outliers; oversized batches simply skip insertion
+/// and refetch on demand.
+const HEADER_FETCH_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+impl BlockCache {
+    /// Best-effort insert. Skips the block if the cache is already full or
+    /// if the block alone exceeds the budget; the caller's get_block path
+    /// will simply refetch on the (rare) miss that follows.
+    fn try_insert(&mut self, hash: BlockHash, block: SerBlock) {
+        let block_bytes = block.len();
+        if block_bytes > HEADER_FETCH_CACHE_MAX_BYTES {
+            return;
+        }
+        if self.map.contains_key(&hash) {
+            return;
+        }
+        if self.bytes + block_bytes > HEADER_FETCH_CACHE_MAX_BYTES {
+            return;
+        }
+        self.bytes += block_bytes;
+        self.map.insert(hash, block);
+    }
+
+    /// Remove and return a cached block, decreasing the byte count.
+    fn take(&mut self, hash: &BlockHash) -> Option<SerBlock> {
+        let block = self.map.remove(hash)?;
+        self.bytes = self.bytes.saturating_sub(block.len());
+        Some(block)
+    }
 }
 
 impl IpcChain {
@@ -72,7 +128,10 @@ impl IpcChain {
         ready_rx
             .recv()
             .context("IPC worker thread exited before signalling readiness")??;
-        Ok(Self { tx })
+        Ok(Self {
+            tx,
+            header_fetch_cache: Arc::new(Mutex::new(BlockCache::default())),
+        })
     }
 
     /// Submit a job to the worker and block on its result.
@@ -158,7 +217,22 @@ impl IpcChain {
 
     /// Fetch a serialized block by hash via `Chain.findBlock(wantData=true)`.
     /// Returns `Ok(None)` if the block is not known to the node.
+    ///
+    /// Consults the header-fetch cache first: blocks downloaded earlier by
+    /// [`Self::get_new_headers`] are handed back without an IPC round-trip,
+    /// and removed from the cache (consume-once semantics).
     pub(crate) fn get_block(&self, hash: BlockHash) -> Result<Option<SerBlock>> {
+        if let Some(block) = self.header_fetch_cache.lock().take(&hash) {
+            return Ok(Some(block));
+        }
+        self.fetch_block(hash)
+    }
+
+    /// Unconditional `findBlock(wantData=true)` fetch with no cache
+    /// interaction; used internally by [`Self::get_block`] (on cache miss)
+    /// and by [`Self::get_new_headers`] (which inserts the result into the
+    /// cache for the immediately-following `for_blocks` pass).
+    fn fetch_block(&self, hash: BlockHash) -> Result<Option<SerBlock>> {
         let raw: [u8; 32] = hash.to_byte_array();
         self.call(move |ctx| {
             async move {
@@ -258,17 +332,23 @@ impl IpcChain {
     /// (taken from `chain`) and the node's active chain, returning every new
     /// header up to the node's current tip. Each header is fetched by way of
     /// `findBlock(wantData=true)` followed by parsing the first 80 bytes as a
-    /// `BlockHeader`; the chain interface does not expose a header-only fetch,
-    /// so the full block payload is downloaded and the body is discarded.
-    /// The returned headers are immediately re-fetched in full by the
-    /// subsequent `for_blocks` indexing pass — acceptable for an experimental
-    /// backend over a local unix socket, but worth noting.
+    /// `BlockHeader`; the chain interface does not expose a header-only
+    /// fetch, so the full block payload is downloaded. To avoid an immediate
+    /// duplicate fetch, the payload is stashed in the header-fetch cache and
+    /// handed back to the subsequent `for_blocks` indexing pass.
     ///
-    /// Caps the response at 2000 headers per call to mirror the P2P
-    /// `getheaders` semantics, so the caller can drive multiple iterations
-    /// during initial sync.
+    /// Caps the response at [`MAX_HEADERS`] per call so the caller can drive
+    /// multiple iterations during initial sync. The cap is small (vs.
+    /// the 2000-header P2P `getheaders` batch) for two reasons: (1) each
+    /// header costs a full block over IPC until upstream grows a header-only
+    /// fetch, so larger batches blow past the in-process block cache budget
+    /// on mainnet; (2) over a local unix socket, round-trip cost is dominated
+    /// by per-block work, not per-batch overhead, so the historical P2P
+    /// argument for huge batches doesn't carry over.
     pub(crate) fn get_new_headers(&self, chain: &Chain) -> Result<Vec<NewHeader>> {
-        const MAX_HEADERS: usize = 2_000;
+        /// Headers per `get_new_headers` call. See the function-level
+        /// comment above for why this is much smaller than the P2P value.
+        const MAX_HEADERS: usize = 100;
 
         let tip_height = match self.get_height()? {
             Some(h) if h >= 0 => h as usize,
@@ -296,7 +376,7 @@ impl IpcChain {
         for h in new_first..=new_last {
             let hash = self.get_block_hash(h as i32)?;
             let block = self
-                .get_block(hash)?
+                .fetch_block(hash)?
                 .ok_or_else(|| anyhow!("findBlock: missing block {hash} at height {h}"))?;
             if block.len() < 80 {
                 bail!(
@@ -307,6 +387,10 @@ impl IpcChain {
             let header = BlockHeader::consensus_decode(&mut &block[..80])
                 .with_context(|| format!("parsing header at height {h}"))?;
             headers.push(NewHeader::from((header, h)));
+            // Stash the payload for the for_blocks pass that will follow
+            // immediately. Best-effort: when the cache is full, additional
+            // blocks will simply be re-fetched on demand.
+            self.header_fetch_cache.lock().try_insert(hash, block);
         }
         Ok(headers)
     }
