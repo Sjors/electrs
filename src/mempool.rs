@@ -7,6 +7,7 @@ use std::ops::Bound;
 
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, OutPoint, Transaction, Txid};
+use crossbeam_channel::Receiver;
 use serde::ser::{Serialize, SerializeSeq, Serializer};
 
 use crate::{
@@ -22,6 +23,11 @@ pub(crate) struct Entry {
     pub fee: Amount,
     pub vsize: u64,
     pub has_unconfirmed_inputs: bool,
+}
+
+pub(crate) enum MempoolEvent {
+    Added(Transaction),
+    Removed(Txid),
 }
 
 /// Mempool current state
@@ -183,10 +189,15 @@ impl Mempool {
         let added = update.new_entries.len();
 
         for txid_to_remove in update.removed_entries {
-            self.remove_entry(txid_to_remove);
+            if self.entries.contains_key(&txid_to_remove) {
+                self.remove_entry(txid_to_remove);
+            }
         }
 
         for entry in update.new_entries {
+            if self.entries.contains_key(&entry.txid) {
+                self.remove_entry(entry.txid);
+            }
             self.add_entry(entry);
         }
 
@@ -210,7 +221,66 @@ impl Mempool {
         }
     }
 
+    fn sync_notifications(&mut self, daemon: &Daemon, events: &Receiver<MempoolEvent>) {
+        let mut added_txs = HashMap::<Txid, Transaction>::new();
+        let mut removed_entries = HashSet::<Txid>::new();
+
+        for event in events.try_iter() {
+            match event {
+                MempoolEvent::Added(tx) => {
+                    let txid = tx.compute_txid();
+                    removed_entries.remove(&txid);
+                    added_txs.insert(txid, tx);
+                }
+                MempoolEvent::Removed(txid) => {
+                    added_txs.remove(&txid);
+                    removed_entries.insert(txid);
+                }
+            }
+        }
+
+        let txids: Vec<Txid> = added_txs.keys().copied().collect();
+        let mut new_entries = Vec::with_capacity(txids.len());
+        if !txids.is_empty() {
+            match daemon.get_mempool_entries(&txids) {
+                Ok(entries) => {
+                    for (txid, entry) in txids.into_iter().zip(entries) {
+                        let Some(entry) = entry else {
+                            debug!("missing mempool entry: {}", txid);
+                            continue;
+                        };
+                        let Some(tx) = added_txs.remove(&txid) else {
+                            continue;
+                        };
+                        new_entries.push(Entry {
+                            txid,
+                            tx,
+                            vsize: entry.vsize,
+                            fee: entry.fees.base,
+                            has_unconfirmed_inputs: !entry.depends.is_empty(),
+                        });
+                    }
+                }
+                Err(e) => warn!("mempool notification metadata sync failed: {}", e),
+            }
+        }
+
+        if new_entries.is_empty() && removed_entries.is_empty() {
+            return;
+        }
+
+        self.apply_sync_update(MempoolSyncUpdate {
+            new_entries,
+            removed_entries,
+        });
+    }
+
     pub fn sync(&mut self, daemon: &Daemon, exit_flag: &ExitFlag) {
+        if let Some(events) = daemon.mempool_events() {
+            self.sync_notifications(daemon, events);
+            return;
+        }
+
         let loaded = match daemon.get_mempool_info() {
             Ok(info) => info.loaded.unwrap_or(true),
             Err(e) => {

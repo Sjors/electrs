@@ -17,6 +17,7 @@ use crate::{
     chain::{Chain, NewHeader},
     config::Config,
     ipc::IpcChain,
+    mempool::MempoolEvent,
     metrics::Metrics,
     p2p::Connection,
     signals::ExitFlag,
@@ -108,11 +109,11 @@ pub struct Daemon {
     p2p: Option<Mutex<Connection>>,
     rpc: Client,
     ipc: Option<IpcChain>,
-    /// When IPC is configured, a long-running task on the IPC worker watches
-    /// `Chain.waitForNotificationsIfTipChanged` and signals on this channel
-    /// each time the tip changes. Used in place of the P2P `inv`-watching
-    /// path for `new_block_notification`.
+    /// When IPC is configured, a long-running ChainNotifications handler on
+    /// the IPC worker signals on this channel each time the tip changes. Used
+    /// in place of the P2P `inv`-watching path for `new_block_notification`.
     ipc_block_notifier: Option<Receiver<()>>,
+    ipc_mempool_events: Option<Receiver<MempoolEvent>>,
 }
 
 impl Daemon {
@@ -181,14 +182,18 @@ impl Daemon {
             bail!("electrs requires non-pruned bitcoind node");
         }
 
-        // Start the IPC tip-change notifier if available, so we can avoid the
-        // P2P `inv`-watching path for new-block notifications.
-        let ipc_block_notifier = match &ipc {
-            Some(ipc) => Some(
-                ipc.start_block_notifier()
-                    .context("failed to start IPC block notifier")?,
-            ),
-            None => None,
+        // Register one IPC ChainNotifications handler for both mempool events
+        // and tip changes. This avoids the P2P `inv`-watching path and lets
+        // the mempool tracker consume node-pushed updates instead of polling
+        // `getrawmempool`.
+        let (ipc_mempool_events, ipc_block_notifier) = match &ipc {
+            Some(ipc) => {
+                let (mempool_events, block_notifier) = ipc
+                    .start_notifications()
+                    .context("failed to start IPC chain notifications")?;
+                (Some(mempool_events), Some(block_notifier))
+            }
+            None => (None, None),
         };
 
         Ok(Self {
@@ -196,6 +201,7 @@ impl Daemon {
             rpc,
             ipc,
             ipc_block_notifier,
+            ipc_mempool_events,
         })
     }
 
@@ -414,6 +420,10 @@ impl Daemon {
             return rx.clone();
         }
         self.p2p().lock().new_block_notification()
+    }
+
+    pub(crate) fn mempool_events(&self) -> Option<&Receiver<MempoolEvent>> {
+        self.ipc_mempool_events.as_ref()
     }
 
     /// Accessor for the P2P connection. Panics if called when IPC is

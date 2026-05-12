@@ -14,20 +14,21 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::thread as stdthread;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use bitcoin::blockdata::block::Header as BlockHeader;
-use bitcoin::{consensus::Decodable, hashes::Hash, BlockHash};
+use bitcoin::{consensus::deserialize, consensus::Decodable, hashes::Hash, BlockHash};
 use bitcoin_capnp_types::{
-    chain_capnp::chain,
+    chain_capnp::{chain, chain_notifications},
     init_capnp::init,
     proxy_capnp::{thread as proxy_thread, thread_map},
 };
 use capnp_rpc::{rpc_twoparty_capnp::Side, twoparty::VatNetwork, RpcSystem};
-use crossbeam_channel::{bounded, Receiver};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use futures::{future::LocalBoxFuture, io::BufReader, FutureExt};
 use parking_lot::Mutex;
 use tokio::net::UnixStream;
@@ -35,6 +36,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::chain::{Chain, NewHeader};
+use crate::mempool::MempoolEvent;
 use crate::types::SerBlock;
 
 /// Boxed (non-Send) future returned by a job. The closure itself must be
@@ -182,6 +184,28 @@ impl IpcChain {
             }
             .boxed_local()
         })
+    }
+
+    /// Register a `ChainNotifications` handler and request a one-shot replay of
+    /// the node's current mempool. The returned receivers are fed by the IPC
+    /// worker thread for as long as the chain notification handler is alive.
+    pub(crate) fn start_notifications(&self) -> Result<(Receiver<MempoolEvent>, Receiver<()>)> {
+        let (mempool_tx, mempool_rx) = unbounded::<MempoolEvent>();
+        let (block_tx, block_rx) = bounded::<()>(1);
+        let (ready_tx, ready_rx) = oneshot::channel::<Result<()>>();
+        let job: Job = Box::new(move |ctx| {
+            async move {
+                register_notifications(ctx, mempool_tx, block_tx, ready_tx).await;
+            }
+            .boxed_local()
+        });
+        self.tx
+            .send(job)
+            .map_err(|_| anyhow!("IPC worker thread is gone"))?;
+        ready_rx
+            .blocking_recv()
+            .map_err(|_| anyhow!("IPC worker dropped notification setup response"))??;
+        Ok((mempool_rx, block_rx))
     }
 
     pub(crate) fn have_pruned(&self) -> Result<bool> {
@@ -497,6 +521,135 @@ impl IpcChain {
             .send(job)
             .map_err(|_| anyhow!("IPC worker thread is gone"))?;
         Ok(notif_rx)
+    }
+}
+
+struct ChainNotificationHandler {
+    mempool_tx: Sender<MempoolEvent>,
+    block_tx: Sender<()>,
+}
+
+impl ChainNotificationHandler {
+    fn send_mempool_event(&self, event: MempoolEvent) {
+        if let Err(e) = self.mempool_tx.try_send(event) {
+            warn!("IPC notification: dropping mempool event: {e}");
+        }
+    }
+
+    fn send_block_event(&self) {
+        let _ = self.block_tx.try_send(());
+    }
+}
+
+impl chain_notifications::Server for ChainNotificationHandler {
+    fn destroy(
+        self: Rc<Self>,
+        _: chain_notifications::DestroyParams,
+        _: chain_notifications::DestroyResults,
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
+        std::future::ready(Ok(()))
+    }
+
+    fn transaction_added_to_mempool(
+        self: Rc<Self>,
+        params: chain_notifications::TransactionAddedToMempoolParams,
+        _: chain_notifications::TransactionAddedToMempoolResults,
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
+        async move {
+            let p = params.get()?;
+            match deserialize(p.get_tx()?) {
+                Ok(tx) => self.send_mempool_event(MempoolEvent::Added(tx)),
+                Err(e) => warn!("IPC notification: invalid mempool transaction: {e}"),
+            }
+            Ok(())
+        }
+    }
+
+    fn transaction_removed_from_mempool(
+        self: Rc<Self>,
+        params: chain_notifications::TransactionRemovedFromMempoolParams,
+        _: chain_notifications::TransactionRemovedFromMempoolResults,
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
+        async move {
+            let p = params.get()?;
+            match deserialize::<bitcoin::Transaction>(p.get_tx()?) {
+                Ok(tx) => self.send_mempool_event(MempoolEvent::Removed(tx.compute_txid())),
+                Err(e) => warn!("IPC notification: invalid removed mempool transaction: {e}"),
+            }
+            Ok(())
+        }
+    }
+
+    fn block_connected(
+        self: Rc<Self>,
+        _: chain_notifications::BlockConnectedParams,
+        _: chain_notifications::BlockConnectedResults,
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
+        std::future::ready(Ok(()))
+    }
+
+    fn block_disconnected(
+        self: Rc<Self>,
+        _: chain_notifications::BlockDisconnectedParams,
+        _: chain_notifications::BlockDisconnectedResults,
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
+        std::future::ready(Ok(()))
+    }
+
+    fn updated_block_tip(
+        self: Rc<Self>,
+        _: chain_notifications::UpdatedBlockTipParams,
+        _: chain_notifications::UpdatedBlockTipResults,
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
+        self.send_block_event();
+        std::future::ready(Ok(()))
+    }
+
+    fn chain_state_flushed(
+        self: Rc<Self>,
+        _: chain_notifications::ChainStateFlushedParams,
+        _: chain_notifications::ChainStateFlushedResults,
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
+        std::future::ready(Ok(()))
+    }
+}
+
+async fn register_notifications(
+    ctx: Ctx,
+    mempool_tx: Sender<MempoolEvent>,
+    block_tx: Sender<()>,
+    ready_tx: oneshot::Sender<Result<()>>,
+) {
+    let setup = async {
+        let handler = Rc::new(ChainNotificationHandler {
+            mempool_tx,
+            block_tx,
+        });
+        let notifications: chain_notifications::Client = capnp_rpc::new_client_from_rc(handler);
+
+        let mut req = ctx.chain.handle_notifications_request();
+        req.get().get_context()?.set_thread(ctx.thread.clone());
+        req.get().set_notifications(notifications.clone());
+        let resp = req.send().promise.await?;
+        let _handler = resp.get()?.get_result()?;
+
+        let mut req = ctx.chain.request_mempool_transactions_request();
+        req.get().get_context()?.set_thread(ctx.thread.clone());
+        req.get().set_notifications(notifications);
+        req.send().promise.await?;
+
+        Ok::<_, anyhow::Error>(_handler)
+    }
+    .await;
+
+    match setup {
+        Ok(_handler) => {
+            let _ = ready_tx.send(Ok(()));
+            futures::future::pending::<()>().await;
+        }
+        Err(e) => {
+            let _ = ready_tx.send(Err(e));
+        }
     }
 }
 
