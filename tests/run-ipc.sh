@@ -1,5 +1,18 @@
 #!/bin/bash
+# Integration test variant that exercises the experimental Cap'n Proto IPC
+# backend introduced for Bitcoin Core PR #29409. Requires a multiprocess
+# `bitcoin` multi-call binary (resolved via $BITCOIN_MULTIPROCESS_BIN or
+# `bitcoin` on PATH) and a freshly built electrs.
 set -euo pipefail
+
+BITCOIN_MULTIPROCESS_BIN="${BITCOIN_MULTIPROCESS_BIN:-$(command -v bitcoin || true)}"
+
+if [ -z "$BITCOIN_MULTIPROCESS_BIN" ] || [ ! -x "$BITCOIN_MULTIPROCESS_BIN" ]; then
+  echo "ERROR: multiprocess 'bitcoin' multi-call binary not found." >&2
+  echo "Set BITCOIN_MULTIPROCESS_BIN to the binary built from bitcoin/bitcoin#29409," >&2
+  echo "or place it on PATH as 'bitcoin'." >&2
+  exit 1
+fi
 
 rm -rf data/
 mkdir -p data/{bitcoin,electrum,electrs}
@@ -62,15 +75,27 @@ wait_for_http() {
   return 1
 }
 
-BTC="bitcoin-cli -regtest -datadir=data/bitcoin"
+BTC="$BITCOIN_MULTIPROCESS_BIN rpc -chain=regtest -datadir=$PWD/data/bitcoin"
 ELECTRUM="electrum --regtest"
 EL="$ELECTRUM --wallet=data/electrum/wallet"
+SOCK="$PWD/data/bitcoin/regtest/node.sock"
 
-echo "Starting $(bitcoind -version | head -n1)..."
-bitcoind -regtest -datadir=data/bitcoin -printtoconsole=0 &
+echo "Starting $($BITCOIN_MULTIPROCESS_BIN node -version | head -n1) (multiprocess, IPC enabled)..."
+$BITCOIN_MULTIPROCESS_BIN node \
+  -regtest -datadir=$PWD/data/bitcoin \
+  -ipcbind=unix \
+  -listen=0 \
+  -printtoconsole=0 \
+  -fallbackfee=0.0001 &
 BITCOIND_PID=$!
 
+# Wait for both RPC and the IPC socket.
 $BTC -rpcwait getblockcount > /dev/null
+for _ in `seq 0 50`; do
+  test -S "$SOCK" && break || sleep 0.2
+done
+test -S "$SOCK" || { echo "IPC socket $SOCK never appeared" >&2; exit 1; }
+echo "IPC socket ready: $SOCK"
 
 echo "Creating Electrum `electrum version --offline` wallet..."
 WALLET=`$EL --offline create --seed_type=segwit`
@@ -86,9 +111,12 @@ electrs \
   --db-dir=data/electrs \
   --daemon-dir=data/bitcoin \
   --network=regtest \
+  --daemon-ipc-socket="$SOCK" \
   2> data/electrs/regtest-debug.log &
 ELECTRS_PID=$!
 wait_for_log data/electrs/regtest-debug.log "serving Electrum RPC" "electrs Electrum RPC startup"
+wait_for_log data/electrs/regtest-debug.log "connecting to bitcoin-node IPC socket" "electrs IPC backend connection"
+
 wait_for_http http://localhost:24224 metrics.txt
 
 $ELECTRUM daemon --server localhost:60401:t -1 -vDEBUG 2> data/electrum/regtest-debug.log &
@@ -99,7 +127,7 @@ $EL getinfo | jq .
 echo "Loading Electrum wallet..."
 $EL load_wallet
 
-echo "Running integration tests:"
+echo "Running integration tests (IPC backend):"
 
 echo " * getbalance"
 wait_for "$EL getbalance" == '{"confirmed":"550","unmatured":"4950"}'
@@ -143,9 +171,12 @@ kill -INT $ELECTRS_PID  # close server
 wait_for_log data/electrs/regtest-debug.log "electrs stopped" "electrs shutdown"
 wait $ELECTRS_PID
 
-# Try a graceful stop; if the node has already exited the RPC call will fail,
-# which is fine.
-$BTC stop 2>/dev/null || kill $BITCOIND_PID 2>/dev/null || true
+# When the multiprocess node has IPC clients still attached at shutdown, the
+# RPC `stop` request hangs indefinitely waiting for them to disconnect. The
+# IPC client lives in electrs, which has already stopped above but whose
+# capnp connection drop is not flushed back to the node. Skip the polite
+# stop and just kill the node — this is a regtest fixture.
+kill $BITCOIND_PID 2>/dev/null || true
 wait $BITCOIND_PID 2>/dev/null || true
 
-echo "=== PASSED ==="
+echo "=== PASSED (IPC) ==="

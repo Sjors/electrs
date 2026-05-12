@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 
 use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::{consensus::deserialize, hashes::hex::FromHex};
-use bitcoin::{Amount, BlockHash, Transaction, Txid};
+use bitcoin::{Amount, BlockHash, OutPoint, Transaction, Txid};
 use bitcoincore_rpc::{json, jsonrpc, Auth, Client, RpcApi};
 use crossbeam_channel::Receiver;
 use parking_lot::Mutex;
@@ -16,6 +16,8 @@ use std::path::Path;
 use crate::{
     chain::{Chain, NewHeader},
     config::Config,
+    ipc::{IpcChain, IpcCoin},
+    mempool::MempoolEvent,
     metrics::Metrics,
     p2p::Connection,
     signals::ExitFlag,
@@ -100,8 +102,18 @@ fn rpc_connect(config: &Config) -> Result<Client> {
 }
 
 pub struct Daemon {
-    p2p: Mutex<Connection>,
+    /// P2P connection to bitcoind. Only constructed when IPC is *not*
+    /// configured; with IPC, header sync, block fetch, and new-block
+    /// notifications all go through the Chain interface and the P2P
+    /// connection is unnecessary.
+    p2p: Option<Mutex<Connection>>,
     rpc: Client,
+    ipc: Option<IpcChain>,
+    /// When IPC is configured, a long-running ChainNotifications handler on
+    /// the IPC worker signals on this channel each time the tip changes. Used
+    /// in place of the P2P `inv`-watching path for `new_block_notification`.
+    ipc_block_notifier: Option<Receiver<()>>,
+    ipc_mempool_events: Option<Receiver<MempoolEvent>>,
 }
 
 impl Daemon {
@@ -131,23 +143,81 @@ impl Daemon {
         if network_info.version < 21_00_00 {
             bail!("electrs requires bitcoind 0.21+");
         }
-        if !network_info.network_active {
-            bail!("electrs requires active bitcoind p2p network");
-        }
-        let info = rpc.get_blockchain_info()?;
-        if info.pruned {
+
+        let ipc = match config.daemon_ipc_socket.as_deref() {
+            Some(path) => {
+                info!(
+                    "connecting to bitcoin-node IPC socket: {} (experimental)",
+                    path.display()
+                );
+                Some(IpcChain::connect(path).context("IPC chain connection failed")?)
+            }
+            None => None,
+        };
+
+        // Skip the P2P connection entirely when IPC is available: header
+        // sync, block fetch, and new-block notifications all go through the
+        // Chain interface in that case. Without IPC we still need P2P, so
+        // also enforce that bitcoind has its P2P network enabled.
+        let p2p = if ipc.is_some() {
+            None
+        } else {
+            if !network_info.network_active {
+                bail!("electrs requires active bitcoind p2p network");
+            }
+            Some(Mutex::new(Connection::connect(
+                config.daemon_p2p_addr,
+                metrics,
+                config.magic,
+            )?))
+        };
+
+        // Check the node is non-pruned, preferring the IPC chain interface
+        // over the JSON-RPC `getblockchaininfo` call when it is available.
+        let pruned = match &ipc {
+            Some(ipc) => ipc.have_pruned().context("Chain.havePruned failed")?,
+            None => rpc.get_blockchain_info()?.pruned,
+        };
+        if pruned {
             bail!("electrs requires non-pruned bitcoind node");
         }
 
-        let p2p = Mutex::new(Connection::connect(
-            config.daemon_p2p_addr,
-            metrics,
-            config.magic,
-        )?);
-        Ok(Self { p2p, rpc })
+        // Register one IPC ChainNotifications handler for both mempool events
+        // and tip changes. This avoids the P2P `inv`-watching path and lets
+        // the mempool tracker consume node-pushed updates instead of polling
+        // `getrawmempool`.
+        let (ipc_mempool_events, ipc_block_notifier) = match &ipc {
+            Some(ipc) => {
+                let (mempool_events, block_notifier) = ipc
+                    .start_notifications()
+                    .context("failed to start IPC chain notifications")?;
+                (Some(mempool_events), Some(block_notifier))
+            }
+            None => (None, None),
+        };
+
+        Ok(Self {
+            p2p,
+            rpc,
+            ipc,
+            ipc_block_notifier,
+            ipc_mempool_events,
+        })
     }
 
     pub(crate) fn estimate_fee(&self, nblocks: u16) -> Result<Option<Amount>> {
+        if let Some(ipc) = &self.ipc {
+            // Chain.estimateSmartFee returns CFeeRate{} (size==0) when no
+            // estimate is available, which mirrors the JSON-RPC -32603
+            // ("Insufficient data or no feerate found") behaviour we map to
+            // None below.
+            let sat_per_kvb = ipc
+                .estimate_smart_fee_sat_per_kvb(nblocks.into())
+                .context("failed to estimate fee via IPC")?;
+            return Ok(sat_per_kvb
+                .filter(|n| *n > 0)
+                .map(|n| Amount::from_sat(n as u64)));
+        }
         let res = self.rpc.estimate_smart_fee(nblocks, None);
         if let Err(bitcoincore_rpc::Error::JsonRpc(jsonrpc::Error::Rpc(RpcError {
             code: -32603,
@@ -160,6 +230,16 @@ impl Daemon {
     }
 
     pub(crate) fn get_relay_fee(&self) -> Result<Amount> {
+        if let Some(ipc) = &self.ipc {
+            let sat_per_kvb = ipc
+                .relay_min_fee_sat_per_kvb()
+                .context("failed to fetch relay min fee via IPC")?;
+            // sat_per_kvb is non-negative in practice (the node clamps the
+            // configured -minrelaytxfee at 0); guard against a corrupt or
+            // hostile reply by saturating at 0 rather than panicking on the
+            // i64 -> u64 conversion.
+            return Ok(Amount::from_sat(sat_per_kvb.max(0) as u64));
+        }
         Ok(self
             .rpc
             .get_network_info()
@@ -168,6 +248,12 @@ impl Daemon {
     }
 
     pub(crate) fn broadcast(&self, tx: &Transaction) -> Result<Txid> {
+        if let Some(ipc) = &self.ipc {
+            let bytes = bitcoin::consensus::serialize(tx);
+            ipc.broadcast_transaction(bytes)
+                .context("failed to broadcast transaction via IPC")?;
+            return Ok(tx.compute_txid());
+        }
         self.rpc
             .send_raw_transaction(tx)
             .context("failed to broadcast transaction")
@@ -219,6 +305,15 @@ impl Daemon {
     }
 
     pub(crate) fn get_block_txids(&self, blockhash: BlockHash) -> Result<Vec<Txid>> {
+        if let Some(ipc) = &self.ipc {
+            let bytes = ipc
+                .get_block(blockhash)
+                .with_context(|| format!("IPC findBlock failed for {blockhash}"))?
+                .ok_or_else(|| anyhow!("IPC findBlock: block {blockhash} not found"))?;
+            let block = crate::ipc::decode_block(&bytes)
+                .with_context(|| format!("failed to decode block {blockhash}"))?;
+            return Ok(block.txdata.iter().map(|tx| tx.compute_txid()).collect());
+        }
         Ok(self
             .rpc
             .get_block_info(&blockhash)
@@ -288,20 +383,64 @@ impl Daemon {
             .collect())
     }
 
-    pub(crate) fn get_new_headers(&self, chain: &Chain) -> Result<Vec<NewHeader>> {
-        self.p2p.lock().get_new_headers(chain)
+    pub(crate) fn find_coins(&self, outpoints: Vec<OutPoint>) -> Result<Vec<IpcCoin>> {
+        self.ipc
+            .as_ref()
+            .context("Chain.findCoins requested without IPC connection")?
+            .find_coins(outpoints)
+            .context("Chain.findCoins failed")
     }
 
-    pub(crate) fn for_blocks<B, F>(&self, blockhashes: B, func: F) -> Result<()>
+    pub(crate) fn get_new_headers(&self, chain: &Chain) -> Result<Vec<NewHeader>> {
+        if let Some(ipc) = &self.ipc {
+            return ipc
+                .get_new_headers(chain)
+                .context("IPC get_new_headers failed");
+        }
+        self.p2p().lock().get_new_headers(chain)
+    }
+
+    pub(crate) fn for_blocks<B, F>(&self, blockhashes: B, mut func: F) -> Result<()>
     where
         B: IntoIterator<Item = BlockHash>,
         F: FnMut(BlockHash, SerBlock),
     {
-        self.p2p.lock().for_blocks(blockhashes, func)
+        if let Some(ipc) = &self.ipc {
+            // Fetch each block over IPC instead of P2P. The Chain interface's
+            // `findBlock(wantData=true)` returns the same serialized form
+            // electrs's P2P path delivers, so the downstream pipeline is
+            // unchanged.
+            for hash in blockhashes {
+                let block = ipc
+                    .get_block(hash)
+                    .with_context(|| format!("IPC findBlock failed for {hash}"))?
+                    .ok_or_else(|| anyhow!("IPC findBlock: block {hash} not found"))?;
+                func(hash, block);
+            }
+            Ok(())
+        } else {
+            self.p2p().lock().for_blocks(blockhashes, func)
+        }
     }
 
     pub(crate) fn new_block_notification(&self) -> Receiver<()> {
-        self.p2p.lock().new_block_notification()
+        if let Some(rx) = &self.ipc_block_notifier {
+            return rx.clone();
+        }
+        self.p2p().lock().new_block_notification()
+    }
+
+    pub(crate) fn mempool_events(&self) -> Option<&Receiver<MempoolEvent>> {
+        self.ipc_mempool_events.as_ref()
+    }
+
+    /// Accessor for the P2P connection. Panics if called when IPC is
+    /// configured (which is a programmer error: the IPC fast paths above
+    /// must be checked first).
+    fn p2p(&self) -> &Mutex<Connection> {
+        self.p2p
+            .as_ref()
+            .expect("P2P connection accessed but only IPC is configured")
     }
 }
 

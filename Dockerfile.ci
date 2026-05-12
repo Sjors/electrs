@@ -8,9 +8,13 @@ RUN apt-get install -qqy librocksdb-dev wget
 
 ### Electrum Rust Server ###
 FROM base AS electrs-build
-RUN apt-get install -qqy cargo build-essential libclang-dev
+RUN apt-get install -qqy cargo build-essential libclang-dev git capnproto libcapnp-dev
 
-# Install electrs
+# Install electrs (with sibling bitcoin-capnp-types checkout for the
+# experimental chain-interface branch -- see Cargo.toml path dep).
+WORKDIR /build/capnp-types
+RUN git clone --depth 1 --branch 2026/04/chain-interface \
+      https://github.com/Sjors/bitcoin-capnp-types.git .
 WORKDIR /build/electrs
 COPY . .
 ENV ROCKSDB_INCLUDE_DIR=/usr/include

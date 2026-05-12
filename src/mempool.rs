@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::convert::TryFrom;
@@ -7,6 +7,7 @@ use std::ops::Bound;
 
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, OutPoint, Transaction, Txid};
+use crossbeam_channel::Receiver;
 use serde::ser::{Serialize, SerializeSeq, Serializer};
 
 use crate::{
@@ -23,6 +24,14 @@ pub(crate) struct Entry {
     pub vsize: u64,
     pub has_unconfirmed_inputs: bool,
 }
+
+pub(crate) enum MempoolEvent {
+    Added(Transaction),
+    Removed(Txid),
+}
+
+/// Bitcoin Core marks mempool prevout coins with this synthetic height.
+const MEMPOOL_HEIGHT: u32 = 0x7fffffff;
 
 /// Mempool current state
 pub(crate) struct Mempool {
@@ -183,10 +192,15 @@ impl Mempool {
         let added = update.new_entries.len();
 
         for txid_to_remove in update.removed_entries {
-            self.remove_entry(txid_to_remove);
+            if self.entries.contains_key(&txid_to_remove) {
+                self.remove_entry(txid_to_remove);
+            }
         }
 
         for entry in update.new_entries {
+            if self.entries.contains_key(&entry.txid) {
+                self.remove_entry(entry.txid);
+            }
             self.add_entry(entry);
         }
 
@@ -210,7 +224,48 @@ impl Mempool {
         }
     }
 
+    fn sync_notifications(&mut self, daemon: &Daemon, events: &Receiver<MempoolEvent>) {
+        let mut added_txs = HashMap::<Txid, Transaction>::new();
+        let mut removed_entries = HashSet::<Txid>::new();
+
+        for event in events.try_iter() {
+            match event {
+                MempoolEvent::Added(tx) => {
+                    let txid = tx.compute_txid();
+                    removed_entries.remove(&txid);
+                    added_txs.insert(txid, tx);
+                }
+                MempoolEvent::Removed(txid) => {
+                    added_txs.remove(&txid);
+                    removed_entries.insert(txid);
+                }
+            }
+        }
+
+        let mut new_entries = Vec::with_capacity(added_txs.len());
+        for (txid, tx) in added_txs {
+            match entry_from_notification_tx(daemon, txid, tx) {
+                Ok(entry) => new_entries.push(entry),
+                Err(e) => warn!("mempool notification metadata sync failed for {txid}: {e}"),
+            }
+        }
+
+        if new_entries.is_empty() && removed_entries.is_empty() {
+            return;
+        }
+
+        self.apply_sync_update(MempoolSyncUpdate {
+            new_entries,
+            removed_entries,
+        });
+    }
+
     pub fn sync(&mut self, daemon: &Daemon, exit_flag: &ExitFlag) {
+        if let Some(events) = daemon.mempool_events() {
+            self.sync_notifications(daemon, events);
+            return;
+        }
+
         let loaded = match daemon.get_mempool_info() {
             Ok(info) => info.loaded.unwrap_or(true),
             Err(e) => {
@@ -283,6 +338,48 @@ impl Mempool {
             self.fees.remove(bin_index, vsize);
         }
     }
+}
+
+fn entry_from_notification_tx(daemon: &Daemon, txid: Txid, tx: Transaction) -> Result<Entry> {
+    let prevouts: Vec<OutPoint> = tx.input.iter().map(|txin| txin.previous_output).collect();
+    let coins = daemon
+        .find_coins(prevouts)
+        .with_context(|| format!("looking up prevout coins for {txid}"))?;
+    ensure!(
+        coins.len() == tx.input.len(),
+        "got {} prevout coins, expected {}",
+        coins.len(),
+        tx.input.len()
+    );
+
+    let mut input_value = Amount::ZERO;
+    let mut has_unconfirmed_inputs = false;
+    for coin in coins {
+        input_value = input_value
+            .checked_add(coin.value)
+            .ok_or_else(|| anyhow!("input value overflow for {txid}"))?;
+        has_unconfirmed_inputs |= coin.height == MEMPOOL_HEIGHT;
+    }
+
+    let mut output_value = Amount::ZERO;
+    for txout in &tx.output {
+        output_value = output_value
+            .checked_add(txout.value)
+            .ok_or_else(|| anyhow!("output value overflow for {txid}"))?;
+    }
+
+    let fee = input_value
+        .checked_sub(output_value)
+        .ok_or_else(|| anyhow!("negative fee for {txid}"))?;
+    let vsize = tx.vsize() as u64;
+
+    Ok(Entry {
+        txid,
+        tx,
+        fee,
+        vsize,
+        has_unconfirmed_inputs,
+    })
 }
 
 pub(crate) struct FeeHistogram {

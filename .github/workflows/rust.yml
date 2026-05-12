@@ -2,8 +2,6 @@ name: electrs
 
 on:
   push:
-    branches:
-      - master
   pull_request:
   schedule:
     - cron: "0 0 * * *" # once a day
@@ -28,15 +26,16 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Checkout bitcoin-capnp-types (experimental chain-interface branch)
+        run: |
+          git clone --depth 1 --branch 2026/04/chain-interface \
+            https://github.com/Sjors/bitcoin-capnp-types.git ../capnp-types
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: rustfmt, clippy
 
-      - name: Install Rust
-        run: rustup component add rustfmt clippy
-
       - name: Install other dependencies
-        run: sudo apt install build-essential libclang-dev
+        run: sudo apt install build-essential libclang-dev capnproto libcapnp-dev
 
       - name: Format
         run: cargo fmt --all -- --check
@@ -60,3 +59,77 @@ jobs:
         run: docker build -f Dockerfile.ci . --rm -t electrs:tests
       - name: Test
         run: docker run -v $PWD/contrib/:/contrib -v $PWD/tests/:/tests --rm electrs:tests bash /tests/run.sh
+
+  integration-ipc:
+    name: Integration (IPC, experimental, PR 29409)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout electrs
+        uses: actions/checkout@v6
+
+      - name: Checkout bitcoin-capnp-types (experimental chain-interface branch)
+        run: |
+          git clone --depth 1 --branch 2026/04/chain-interface \
+            https://github.com/Sjors/bitcoin-capnp-types.git ../capnp-types
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Install build & test dependencies
+        run: |
+          sudo apt-get update -qqy
+          sudo apt-get install -qqy \
+            build-essential cmake pkgconf python3 \
+            libevent-dev libboost-dev capnproto libcapnp-dev \
+            librocksdb-dev libclang-dev ccache \
+            python3-venv python3-pip git jq curl libsecp256k1-dev
+
+      - name: ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-bitcoin-29409-${{ runner.os }}-${{ github.sha }}
+          restore-keys: ccache-bitcoin-29409-${{ runner.os }}-
+
+      - name: Checkout Bitcoin Core PR #29409
+        run: |
+          git clone --depth 1 https://github.com/bitcoin/bitcoin.git
+          cd bitcoin
+          git fetch --depth 1 origin pull/29409/head:pr-29409
+          git checkout pr-29409
+
+      - name: Build Bitcoin Core (multiprocess)
+        run: |
+          cd bitcoin
+          cmake -B build \
+            -DENABLE_WALLET=ON \
+            -DBUILD_TESTS=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          cmake --build build -j $(nproc) --target bitcoin bitcoin-node bitcoin-cli
+
+      - name: Install Electrum wallet (4.7.2)
+        run: |
+          git clone --depth 1 --branch 4.7.2 --recurse-submodules https://github.com/spesmilo/electrum/
+          python3 -m venv --system-site-packages venv
+          ELECTRUM_ECC_DONT_COMPILE=1 venv/bin/pip install -e electrum/
+          sudo ln -s "$PWD/venv/bin/electrum" /usr/local/bin/electrum
+          electrum version --offline
+
+      - name: Build electrs
+        run: cargo build --locked --bin electrs
+
+      - name: Run IPC integration test
+        env:
+          BITCOIN_MULTIPROCESS_BIN: ${{ github.workspace }}/bitcoin/build/bin/bitcoin
+        run: |
+          export PATH="$PWD/target/debug:$PATH"
+          ./tests/run-ipc.sh
+
+      - name: Upload electrs debug log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: electrs-ipc-debug-log
+          path: |
+            data/electrs/regtest-debug.log
+            data/electrum/regtest-debug.log
