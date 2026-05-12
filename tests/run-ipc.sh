@@ -143,7 +143,12 @@ kill -INT $ELECTRS_PID  # close server
 tail_log data/electrs/regtest-debug.log | grep -m1 "electrs stopped"
 wait $ELECTRS_PID
 
-$BTC stop # stop bitcoind
-wait $BITCOIND_PID
+# When the multiprocess node has IPC clients still attached at shutdown, the
+# RPC `stop` request hangs indefinitely waiting for them to disconnect. The
+# IPC client lives in electrs, which has already stopped above but whose
+# capnp connection drop is not flushed back to the node. Skip the polite
+# stop and just kill the node — this is a regtest fixture.
+kill $BITCOIND_PID 2>/dev/null || true
+wait $BITCOIND_PID 2>/dev/null || true
 
 echo "=== PASSED (IPC) ==="

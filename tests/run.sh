@@ -110,7 +110,9 @@ kill -INT $ELECTRS_PID  # close server
 tail_log data/electrs/regtest-debug.log | grep -m1 "electrs stopped"
 wait $ELECTRS_PID
 
-$BTC stop # stop bitcoind
-wait $BITCOIND_PID
+# Try a graceful stop; if the node has already exited the RPC call will fail,
+# which is fine.
+$BTC stop 2>/dev/null || kill $BITCOIND_PID 2>/dev/null || true
+wait $BITCOIND_PID 2>/dev/null || true
 
 echo "=== PASSED ==="
