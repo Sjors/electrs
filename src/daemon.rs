@@ -101,7 +101,11 @@ fn rpc_connect(config: &Config) -> Result<Client> {
 }
 
 pub struct Daemon {
-    p2p: Mutex<Connection>,
+    /// P2P connection to bitcoind. Only constructed when IPC is *not*
+    /// configured; with IPC, header sync, block fetch, and new-block
+    /// notifications all go through the Chain interface and the P2P
+    /// connection is unnecessary.
+    p2p: Option<Mutex<Connection>>,
     rpc: Client,
     ipc: Option<IpcChain>,
     /// When IPC is configured, a long-running task on the IPC worker watches
@@ -138,15 +142,7 @@ impl Daemon {
         if network_info.version < 21_00_00 {
             bail!("electrs requires bitcoind 0.21+");
         }
-        if !network_info.network_active {
-            bail!("electrs requires active bitcoind p2p network");
-        }
 
-        let p2p = Mutex::new(Connection::connect(
-            config.daemon_p2p_addr,
-            metrics,
-            config.magic,
-        )?);
         let ipc = match config.daemon_ipc_socket.as_deref() {
             Some(path) => {
                 info!(
@@ -156,6 +152,23 @@ impl Daemon {
                 Some(IpcChain::connect(path).context("IPC chain connection failed")?)
             }
             None => None,
+        };
+
+        // Skip the P2P connection entirely when IPC is available: header
+        // sync, block fetch, and new-block notifications all go through the
+        // Chain interface in that case. Without IPC we still need P2P, so
+        // also enforce that bitcoind has its P2P network enabled.
+        let p2p = if ipc.is_some() {
+            None
+        } else {
+            if !network_info.network_active {
+                bail!("electrs requires active bitcoind p2p network");
+            }
+            Some(Mutex::new(Connection::connect(
+                config.daemon_p2p_addr,
+                metrics,
+                config.magic,
+            )?))
         };
 
         // Check the node is non-pruned, preferring the IPC chain interface
@@ -348,7 +361,7 @@ impl Daemon {
                 .get_new_headers(chain)
                 .context("IPC get_new_headers failed");
         }
-        self.p2p.lock().get_new_headers(chain)
+        self.p2p().lock().get_new_headers(chain)
     }
 
     pub(crate) fn for_blocks<B, F>(&self, blockhashes: B, mut func: F) -> Result<()>
@@ -370,7 +383,7 @@ impl Daemon {
             }
             Ok(())
         } else {
-            self.p2p.lock().for_blocks(blockhashes, func)
+            self.p2p().lock().for_blocks(blockhashes, func)
         }
     }
 
@@ -378,7 +391,16 @@ impl Daemon {
         if let Some(rx) = &self.ipc_block_notifier {
             return rx.clone();
         }
-        self.p2p.lock().new_block_notification()
+        self.p2p().lock().new_block_notification()
+    }
+
+    /// Accessor for the P2P connection. Panics if called when IPC is
+    /// configured (which is a programmer error: the IPC fast paths above
+    /// must be checked first).
+    fn p2p(&self) -> &Mutex<Connection> {
+        self.p2p
+            .as_ref()
+            .expect("P2P connection accessed but only IPC is configured")
     }
 }
 
