@@ -17,6 +17,7 @@ use std::pin::Pin;
 use std::thread as stdthread;
 
 use anyhow::{anyhow, bail, Context, Result};
+use bitcoin::blockdata::block::Header as BlockHeader;
 use bitcoin::{consensus::Decodable, hashes::Hash, BlockHash};
 use bitcoin_capnp_types::{
     chain_capnp::chain,
@@ -29,6 +30,7 @@ use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
+use crate::chain::{Chain, NewHeader};
 use crate::types::SerBlock;
 
 /// Boxed (non-Send) future returned by a job. The closure itself must be
@@ -209,6 +211,115 @@ impl IpcChain {
             }
             .boxed_local()
         })
+    }
+
+    /// Find the height of the highest block in `locator` that is part of the
+    /// node's active chain, via `Chain.findLocatorFork`. Returns `None` if no
+    /// hash in the locator is on the active chain (e.g. completely diverged
+    /// chain), in which case the caller should fall back to walking from
+    /// genesis.
+    ///
+    /// `locator` is the list of block hashes returned by [`Chain::locator`],
+    /// ordered tip→genesis with exponentially increasing gaps.
+    pub(crate) fn find_locator_fork(&self, locator: &[BlockHash]) -> Result<Option<i32>> {
+        // Bitcoin Core CBlockLocator wire format: int32 LE version
+        // (DUMMY_VERSION = 70016) + CompactSize count + 32*count hashes.
+        let mut buf = Vec::with_capacity(4 + 9 + locator.len() * 32);
+        buf.extend_from_slice(&70016i32.to_le_bytes());
+        write_compact_size(&mut buf, locator.len() as u64);
+        for hash in locator {
+            buf.extend_from_slice(hash.as_byte_array());
+        }
+        self.call(move |ctx| {
+            async move {
+                let mut req = ctx.chain.find_locator_fork_request();
+                req.get().get_context()?.set_thread(ctx.thread.clone());
+                req.get().set_locator(&buf);
+                let resp = req.send().promise.await?;
+                let r = resp.get()?;
+                Ok(if r.get_has_result() {
+                    Some(r.get_result())
+                } else {
+                    None
+                })
+            }
+            .boxed_local()
+        })
+    }
+
+    /// Replacement for the P2P `getheaders` exchange in [`Daemon::get_new_headers`].
+    ///
+    /// Walks the IPC chain forward from the fork point between the locator
+    /// (taken from `chain`) and the node's active chain, returning every new
+    /// header up to the node's current tip. Each header is fetched by way of
+    /// `findBlock(wantData=true)` followed by parsing the first 80 bytes as a
+    /// `BlockHeader`; the chain interface does not expose a header-only fetch,
+    /// so the full block payload is downloaded and the body is discarded.
+    /// The returned headers are immediately re-fetched in full by the
+    /// subsequent `for_blocks` indexing pass — acceptable for an experimental
+    /// backend over a local unix socket, but worth noting.
+    ///
+    /// Caps the response at 2000 headers per call to mirror the P2P
+    /// `getheaders` semantics, so the caller can drive multiple iterations
+    /// during initial sync.
+    pub(crate) fn get_new_headers(&self, chain: &Chain) -> Result<Vec<NewHeader>> {
+        const MAX_HEADERS: usize = 2_000;
+
+        let tip_height = match self.get_height()? {
+            Some(h) if h >= 0 => h as usize,
+            _ => return Ok(vec![]),
+        };
+
+        // Find the fork height between our chain's locator and the node's
+        // active chain.
+        let locator = chain.locator();
+        let fork_height = self
+            .find_locator_fork(&locator)?
+            .ok_or_else(|| anyhow!("Chain.findLocatorFork: no common ancestor"))?;
+        if fork_height < 0 {
+            bail!("Chain.findLocatorFork returned negative fork height {fork_height}");
+        }
+        let fork_height = fork_height as usize;
+
+        if tip_height <= fork_height {
+            return Ok(vec![]);
+        }
+
+        let new_first = fork_height + 1;
+        let new_last = tip_height.min(fork_height + MAX_HEADERS);
+        let mut headers = Vec::with_capacity(new_last - new_first + 1);
+        for h in new_first..=new_last {
+            let hash = self.get_block_hash(h as i32)?;
+            let block = self
+                .get_block(hash)?
+                .ok_or_else(|| anyhow!("findBlock: missing block {hash} at height {h}"))?;
+            if block.len() < 80 {
+                bail!(
+                    "findBlock returned {} bytes for {hash}; need >=80",
+                    block.len()
+                );
+            }
+            let header = BlockHeader::consensus_decode(&mut &block[..80])
+                .with_context(|| format!("parsing header at height {h}"))?;
+            headers.push(NewHeader::from((header, h)));
+        }
+        Ok(headers)
+    }
+}
+
+/// Bitcoin Core CompactSize encoding (src/serialize.h).
+fn write_compact_size(buf: &mut Vec<u8>, n: u64) {
+    if n < 253 {
+        buf.push(n as u8);
+    } else if n <= u16::MAX as u64 {
+        buf.push(253);
+        buf.extend_from_slice(&(n as u16).to_le_bytes());
+    } else if n <= u32::MAX as u64 {
+        buf.push(254);
+        buf.extend_from_slice(&(n as u32).to_le_bytes());
+    } else {
+        buf.push(255);
+        buf.extend_from_slice(&n.to_le_bytes());
     }
 }
 

@@ -323,6 +323,11 @@ impl Daemon {
     }
 
     pub(crate) fn get_new_headers(&self, chain: &Chain) -> Result<Vec<NewHeader>> {
+        if let Some(ipc) = &self.ipc {
+            return ipc
+                .get_new_headers(chain)
+                .context("IPC get_new_headers failed");
+        }
         self.p2p.lock().get_new_headers(chain)
     }
 
