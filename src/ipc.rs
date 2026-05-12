@@ -595,34 +595,30 @@ impl chain_notifications::Server for ChainNotificationHandler {
         std::future::ready(Ok(()))
     }
 
-    fn transaction_added_to_mempool(
+    async fn transaction_added_to_mempool(
         self: Rc<Self>,
         params: chain_notifications::TransactionAddedToMempoolParams,
         _: chain_notifications::TransactionAddedToMempoolResults,
-    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
-        async move {
-            let p = params.get()?;
-            match deserialize(p.get_tx()?) {
-                Ok(tx) => self.send_mempool_event(MempoolEvent::Added(tx)),
-                Err(e) => warn!("IPC notification: invalid mempool transaction: {e}"),
-            }
-            Ok(())
+    ) -> std::result::Result<(), capnp::Error> {
+        let p = params.get()?;
+        match deserialize(p.get_tx()?) {
+            Ok(tx) => self.send_mempool_event(MempoolEvent::Added(tx)),
+            Err(e) => warn!("IPC notification: invalid mempool transaction: {e}"),
         }
+        Ok(())
     }
 
-    fn transaction_removed_from_mempool(
+    async fn transaction_removed_from_mempool(
         self: Rc<Self>,
         params: chain_notifications::TransactionRemovedFromMempoolParams,
         _: chain_notifications::TransactionRemovedFromMempoolResults,
-    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
-        async move {
-            let p = params.get()?;
-            match deserialize::<bitcoin::Transaction>(p.get_tx()?) {
-                Ok(tx) => self.send_mempool_event(MempoolEvent::Removed(tx.compute_txid())),
-                Err(e) => warn!("IPC notification: invalid removed mempool transaction: {e}"),
-            }
-            Ok(())
+    ) -> std::result::Result<(), capnp::Error> {
+        let p = params.get()?;
+        match deserialize::<bitcoin::Transaction>(p.get_tx()?) {
+            Ok(tx) => self.send_mempool_event(MempoolEvent::Removed(tx.compute_txid())),
+            Err(e) => warn!("IPC notification: invalid removed mempool transaction: {e}"),
         }
+        Ok(())
     }
 
     fn block_connected(
