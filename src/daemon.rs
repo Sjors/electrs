@@ -104,6 +104,11 @@ pub struct Daemon {
     p2p: Mutex<Connection>,
     rpc: Client,
     ipc: Option<IpcChain>,
+    /// When IPC is configured, a long-running task on the IPC worker watches
+    /// `Chain.waitForNotificationsIfTipChanged` and signals on this channel
+    /// each time the tip changes. Used in place of the P2P `inv`-watching
+    /// path for `new_block_notification`.
+    ipc_block_notifier: Option<Receiver<()>>,
 }
 
 impl Daemon {
@@ -163,7 +168,22 @@ impl Daemon {
             bail!("electrs requires non-pruned bitcoind node");
         }
 
-        Ok(Self { p2p, rpc, ipc })
+        // Start the IPC tip-change notifier if available, so we can avoid the
+        // P2P `inv`-watching path for new-block notifications.
+        let ipc_block_notifier = match &ipc {
+            Some(ipc) => Some(
+                ipc.start_block_notifier()
+                    .context("failed to start IPC block notifier")?,
+            ),
+            None => None,
+        };
+
+        Ok(Self {
+            p2p,
+            rpc,
+            ipc,
+            ipc_block_notifier,
+        })
     }
 
     pub(crate) fn estimate_fee(&self, nblocks: u16) -> Result<Option<Amount>> {
@@ -355,6 +375,9 @@ impl Daemon {
     }
 
     pub(crate) fn new_block_notification(&self) -> Receiver<()> {
+        if let Some(rx) = &self.ipc_block_notifier {
+            return rx.clone();
+        }
         self.p2p.lock().new_block_notification()
     }
 }

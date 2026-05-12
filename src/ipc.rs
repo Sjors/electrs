@@ -13,8 +13,8 @@
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::thread as stdthread;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use bitcoin::blockdata::block::Header as BlockHeader;
@@ -25,6 +25,7 @@ use bitcoin_capnp_types::{
     proxy_capnp::{thread as proxy_thread, thread_map},
 };
 use capnp_rpc::{rpc_twoparty_capnp::Side, twoparty::VatNetwork, RpcSystem};
+use crossbeam_channel::{bounded, Receiver};
 use futures::{future::LocalBoxFuture, io::BufReader, FutureExt};
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot};
@@ -36,11 +37,15 @@ use crate::types::SerBlock;
 /// Boxed (non-Send) future returned by a job. The closure itself must be
 /// `Send` so it can be shipped from caller threads to the IPC worker, but
 /// once on the worker it runs on a single-threaded LocalSet, so the future
-/// it produces does not need to be `Send`.
-type Job = Box<dyn for<'a> FnOnce(&'a Ctx) -> LocalBoxFuture<'a, ()> + Send + 'static>;
+/// it produces does not need to be `Send`. Each job receives an owned `Ctx`
+/// (a cheap pair of `Rc`-backed capnp clients), letting the worker spawn
+/// jobs concurrently on the LocalSet without lifetime gymnastics.
+type Job = Box<dyn FnOnce(Ctx) -> LocalBoxFuture<'static, ()> + Send + 'static>;
 
 /// IPC context held by the worker thread: the chain client and the proxy
-/// thread handle that every call must reference.
+/// thread handle that every call must reference. Cloning is cheap (both
+/// fields are `Rc`-backed capnp clients).
+#[derive(Clone)]
 struct Ctx {
     chain: chain::Client,
     thread: proxy_thread::Client,
@@ -74,7 +79,7 @@ impl IpcChain {
     fn call<R, F>(&self, f: F) -> Result<R>
     where
         R: Send + 'static,
-        F: for<'a> FnOnce(&'a Ctx) -> LocalBoxFuture<'a, Result<R>> + Send + 'static,
+        F: FnOnce(Ctx) -> LocalBoxFuture<'static, Result<R>> + Send + 'static,
     {
         let (otx, orx) = oneshot::channel::<Result<R>>();
         let job: Job = Box::new(move |ctx| {
@@ -305,6 +310,89 @@ impl IpcChain {
         }
         Ok(headers)
     }
+
+    /// Spawn a long-running task on the worker that watches for tip changes
+    /// via `Chain.waitForNotificationsIfTipChanged`, and returns a receiver
+    /// that fires once per detected tip change.
+    ///
+    /// This replaces the P2P `inv`-watching path in `src/p2p.rs` for IPC
+    /// deployments. The receiver is bounded to capacity 1 with `try_send`
+    /// semantics: if the consumer is busy, additional notifications are
+    /// coalesced into the pending one.
+    pub(crate) fn start_block_notifier(&self) -> Result<Receiver<()>> {
+        let (notif_tx, notif_rx) = bounded::<()>(1);
+        let job: Job = Box::new(move |ctx| {
+            async move {
+                loop {
+                    // Snapshot the current tip hash so we can ask the node
+                    // to wake us when it changes.
+                    let tip_hash = match snapshot_tip_hash(&ctx).await {
+                        Ok(h) => h,
+                        Err(e) => {
+                            warn!("IPC notifier: tip snapshot failed: {e:#}");
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            continue;
+                        }
+                    };
+
+                    // Block until the tip differs from `tip_hash`. Returns
+                    // immediately if it already does.
+                    let mut req = ctx.chain.wait_for_notifications_if_tip_changed_request();
+                    match req.get().get_context() {
+                        Ok(mut c) => c.set_thread(ctx.thread.clone()),
+                        Err(e) => {
+                            warn!("IPC notifier: failed to set thread: {e:#}");
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            continue;
+                        }
+                    }
+                    req.get().set_old_tip(&tip_hash);
+                    if let Err(e) = req.send().promise.await {
+                        warn!("IPC notifier: waitForNotifications failed: {e:#}");
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        continue;
+                    }
+
+                    // Coalesce: if the receiver is already pending, drop this
+                    // signal (the indexer will see all changes on its next
+                    // sync iteration regardless).
+                    let _ = notif_tx.try_send(());
+                }
+            }
+            .boxed_local()
+        });
+        self.tx
+            .send(job)
+            .map_err(|_| anyhow!("IPC worker thread is gone"))?;
+        Ok(notif_rx)
+    }
+}
+
+/// Helper for the notifier loop: read the current tip hash via
+/// `getHeight` + `getBlockHash`. Returns the all-zeros hash when the node
+/// reports no tip yet (genesis only), which still works for
+/// `waitForNotificationsIfTipChanged` (it'll wake us as soon as a real
+/// tip exists).
+async fn snapshot_tip_hash(ctx: &Ctx) -> Result<[u8; 32]> {
+    let mut req = ctx.chain.get_height_request();
+    req.get().get_context()?.set_thread(ctx.thread.clone());
+    let resp = req.send().promise.await?;
+    let r = resp.get()?;
+    if !r.get_has_result() {
+        return Ok([0u8; 32]);
+    }
+    let height = r.get_result();
+    let mut req = ctx.chain.get_block_hash_request();
+    req.get().get_context()?.set_thread(ctx.thread.clone());
+    req.get().set_height(height);
+    let resp = req.send().promise.await?;
+    let bytes = resp.get()?.get_result()?;
+    if bytes.len() != 32 {
+        bail!("unexpected block hash length {}", bytes.len());
+    }
+    let mut buf = [0u8; 32];
+    buf.copy_from_slice(bytes);
+    Ok(buf)
 }
 
 /// Bitcoin Core CompactSize encoding (src/serialize.h).
@@ -351,8 +439,9 @@ fn worker(
         };
         let _ = ready.send(Ok(()));
         while let Some(job) = rx.recv().await {
-            let fut: Pin<Box<dyn futures::Future<Output = ()>>> = job(&ctx);
-            fut.await;
+            // Spawn each job onto the LocalSet so long-running jobs (e.g. the
+            // block-tip notifier loop) do not block other in-flight calls.
+            tokio::task::spawn_local(job(ctx.clone()));
         }
     }));
 }
